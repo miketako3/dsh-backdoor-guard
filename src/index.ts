@@ -1,23 +1,11 @@
 /**
- * Backdoor guard for DeepSeek Harness — detects trained-in backdoor payloads
- * and credential exfiltration, then stops the agent BEFORE tools execute.
+ * Backdoor guard for DeepSeek Harness — a Jev (TypeSafe AI) judgment model
+ * prices every model-requested tool call before it executes, and calls judged
+ * unsafe are denied at `tools/pre-execute`, before any side effect happens.
  *
- * Layers (all backend-agnostic, no logprobs required):
- *  - policy firewall: every tool call's name + canonical arguments are scanned
- *    for credential locations, exfiltration channels, planted canaries, and
- *    (optionally) rejected outright unless allowlisted.
- *  - behavioral: a sensitive tool fired with no visible-text preamble in the
- *    same attempt is the runtime signature of a memorized payload; such calls
- *    are denied or logged per `silentSensitiveToolAction`.
- *  - canary-in-result: secret material appearing in a tool result cancels the
- *    turn before the value can be relayed onward.
- *  - entropy (optional): when the serving stack attaches per-token logprobs to
- *    stream chunks, a sliding-window mean-entropy collapse flags the attempt
- *    mid-stream and all of its tool calls.
- *
- * Emergency stop is `Agent.cancel({kind:'hook'})`; hard enforcement is a deny
- * at `tools/pre-execute` that never delegates, so no later listener can talk a
- * flagged call back into execution.
+ * Backend-agnostic: the guard needs no logprobs, no fork, and no custom
+ * inference server — only the harness's public plugin seams plus one HTTPS
+ * judgment call per tool call.
  * @module dsh-backdoor-guard
  */
 
@@ -25,14 +13,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContextFormed, LlmAttemptId, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, LlmAttemptId } from '@deepseek-ai/dsh-llm'
 import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-import type { PostToolDecision, PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
-import { EntropyWindow } from './entropy.js'
-import type { TokenLogprob } from './entropy.js'
-import { ToolPolicy, canonicalizeArguments, isSensitiveTool } from './policy.js'
-import type { PolicyHit } from './policy.js'
+import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import { judgeToolCall } from './judge.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -41,72 +26,72 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 export const name = 'backdoor-guard'
-export const inject = ['llm']
 
 /**
- * Plugin config. Numeric fields are re-validated fail-loud in `apply`.
- * `silentSensitiveToolAction`: 'deny' blocks silent sensitive calls, 'observe'
- * only logs them, 'off' disables the behavioral layer.
+ * Plugin config, validated by the same-named schemastery schema plus the
+ * load-time checks in `apply` (misconfiguration fails loud).
  */
 export interface Config {
-  /** Extra deny regexes OR-ed after the built-in credential/exfil set. */
-  denyPatterns?: string[]
-  /** Disable the built-in deny pattern set (custom rules still apply). */
-  disableDefaultDeny?: boolean
-  /** Planted decoy secrets (>= 8 chars each); any appearance flags the call or result. */
-  canaries?: string[]
-  /** When non-empty, only matching (`*`-wildcard) tool names may execute. */
-  allowedTools?: string[]
-  /** Action for a sensitive tool fired without visible preamble: deny / observe / off (default observe). */
-  silentSensitiveToolAction?: 'deny' | 'observe' | 'off'
-  /** Visible characters required before the first tool call to count as announced (default 1). */
-  minPreambleChars?: number
-  /** Sliding-window mean entropy below this many nats flags the attempt (default 0.15). */
-  entropyThresholdNats?: number
-  /** Tokens per entropy window (default 24). */
-  windowTokens?: number
-  /** Enable the entropy layer when logprobs are present on chunks (default true). */
-  entropyEnabled?: boolean
-  /** Detect and log only: never cancel, deny, or inject (default false). */
-  observeOnly?: boolean
+  /**
+   * Environment variable holding the judge API key (default `TYPESAFE_API_KEY`
+   * for the hosted Jev). Set to an empty string for unauthenticated local
+   * endpoints such as a self-hosted d1-3B shim.
+   */
+  apiKeyEnv?: string
+  /** Judge model id (default `jev-latest`; use e.g. `d1-3B` for the LiquidAI shim). */
+  model?: string
+  /**
+   * systemone-compatible endpoint (default `https://api.typesafe.ai/v1/systemone`).
+   * Any server implementing the Decision Index schema works: hosted Jev,
+   * the bundled d1-3B shim (`server/d1-server.py`), or another compatible judge.
+   */
+  endpoint?: string
+  /** Deny calls whose safe-probability is below this threshold (0–1, default 0.5). */
+  threshold?: number
+  /** Judge call timeout in milliseconds (default 8000). */
+  timeoutMs?: number
+  /** Tool names (`*`-wildcard) never sent to the judge (default none — judge everything). */
+  skipTools?: string[]
+  /** Cap on canonical-argument characters shown to the judge (default 2000). */
+  maxArgsChars?: number
+  /** Cap on user-request characters shown to the judge (default 1000). */
+  maxRequestChars?: number
+  /** Judge unreachable/invalid: 'allow' logs and delegates, 'deny' blocks (default 'allow'). */
+  onJudgeError?: 'allow' | 'deny'
 }
 
 export const Config: z<Config> = z.object({
-  denyPatterns: z.array(z.string()).default([]),
-  disableDefaultDeny: z.boolean().default(false),
-  canaries: z.array(z.string()).default([]),
-  allowedTools: z.array(z.string()).default([]),
-  silentSensitiveToolAction: z.union(['deny', 'observe', 'off']).default('observe'),
-  minPreambleChars: z.number().default(1),
-  entropyThresholdNats: z.number().default(0.15),
-  windowTokens: z.number().default(24),
-  entropyEnabled: z.boolean().default(true),
-  observeOnly: z.boolean().default(false),
+  apiKeyEnv: z.string().default('TYPESAFE_API_KEY'),
+  model: z.string().default('jev-latest'),
+  endpoint: z.string().default('https://api.typesafe.ai/v1/systemone'),
+  threshold: z.number().default(0.5),
+  timeoutMs: z.natural().default(8000),
+  skipTools: z.array(z.string()).default([]),
+  maxArgsChars: z.number().default(2000),
+  maxRequestChars: z.number().default(1000),
+  onJudgeError: z.union(['allow', 'deny']).default('allow'),
 })
 
-/** The `{kind:'backdoor-guard'}` producer source stamped on every guard notice. */
+/** The `{kind:'backdoor-guard'}` producer source stamped on guard notices. */
 const NOTICE_SOURCE: MessageSource = { kind: 'backdoor-guard' }
 
-/** Cap on retained denied call ids per agent. */
-const MAX_DENIED_CALL_IDS = 1000
-
-/** Chunks carrying logprobs from adapters that attach them (duck-typed; vanilla chunks never have them). */
-type LogprobChunk = StreamChunk & { readonly logprobs?: readonly TokenLogprob[] }
-
-/** Per-attempt observation state. */
-interface AttemptWatch {
-  readonly agent: Agent
-  readonly attemptId: LlmAttemptId
-  readonly entropy?: EntropyWindow
-  /** Visible text characters emitted before the first tool-call delta. */
-  preambleChars: number
-  seenToolCall: boolean
-  /** callId → tool name, recorded from the first name-bearing delta. */
-  readonly toolCalls: Map<string, string>
-  flagged: boolean
+/** Compile one `*`-wildcard pattern into an anchored, case-insensitive RegExp. */
+function wildcardToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, String.raw`\$&`)
+  return new RegExp(`^${escaped.replaceAll('*', '.*')}$`, 'i')
 }
 
-/** Model- and transcript-visible detection notice. */
+/** Deep key-sort of a parsed-JSON value, then stringify. */
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalize(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/** Transcript-visible notice injected when the judge denies a call. */
 function guardNotice(text: string, summary: string): UserMessage {
   return createUserMessage({
     content: [{ type: 'text', text: `SECURITY NOTICE (backdoor-guard): ${text}` }],
@@ -114,209 +99,134 @@ function guardNotice(text: string, summary: string): UserMessage {
   })
 }
 
+/** Per-agent observation state: the latest user request and the live attempt's shape. */
+interface AgentWatch {
+  lastUserText: string
+  preambleChars: number
+  readonly recentCalls: string[]
+  currentAttempt?: LlmAttemptId
+}
+
+/** Extract the visible text of one message's content blocks. */
+function messageText(message: UserMessage): string {
+  return message.content
+    .map(block => (block as { type: string; text?: string }).text ?? '')
+    .join('')
+}
+
 /**
  * Install the guard's listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
- * @param config - validated {@link Config}.
+ * @param config - validated {@link Config}; numeric fields are re-checked fail-loud here.
  */
 export function apply(ctx: Context, config: Config): void {
-  const threshold = config.entropyThresholdNats as number
-  const windowTokens = config.windowTokens as number
-  const minPreambleChars = config.minPreambleChars as number
-  const silentAction = config.silentSensitiveToolAction as 'deny' | 'observe' | 'off'
-  const entropyEnabled = config.entropyEnabled as boolean
-  const observeOnly = config.observeOnly as boolean
-  if (!Number.isInteger(minPreambleChars) || minPreambleChars < 0) {
-    throw new Error('backdoor-guard: `minPreambleChars` must be an integer >= 0')
+  const apiKeyEnv = config.apiKeyEnv as string
+  const threshold = config.threshold as number
+  const timeoutMs = config.timeoutMs as number
+  const maxArgsChars = config.maxArgsChars as number
+  const maxRequestChars = config.maxRequestChars as number
+  const onJudgeError = config.onJudgeError as 'allow' | 'deny'
+  const skipPatterns = (config.skipTools as string[]).map(wildcardToRegExp)
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error('backdoor-guard: `threshold` must be a number between 0 and 1')
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1) {
+    throw new Error('backdoor-guard: `timeoutMs` must be a positive integer')
+  }
+  // An empty apiKeyEnv is a deliberate choice: unauthenticated local judge.
+
+  const watches = new WeakMap<Agent, AgentWatch>()
+
+  /** The agent's watch state, created on first activity. */
+  function watchOf(agent: Agent): AgentWatch {
+    let watch = watches.get(agent)
+    if (watch === undefined) {
+      watch = { lastUserText: '', preambleChars: 0, recentCalls: [] }
+      watches.set(agent, watch)
+    }
+    return watch
   }
 
-  const policy = new ToolPolicy({
-    denyPatterns: config.denyPatterns as string[],
-    disableDefaultDeny: config.disableDefaultDeny as boolean,
-    canaries: config.canaries as string[],
-    allowedTools: config.allowedTools as string[],
-  })
-
-  const watches = new Map<LlmAttemptId, AttemptWatch>()
-  /** Recent attempts per agent, oldest first; tool calls execute after 'end', so watches outlive their attempt. */
-  const watchOrder = new WeakMap<Agent, LlmAttemptId[]>()
-  const deniedCalls = new WeakMap<Agent, Set<string>>()
-
-  /** Retain at most this many watches per agent (covers in-flight tool dispatch). */
-  const MAX_WATCHES_PER_AGENT = 8
-
-  /** Remember one watch and evict the agent's oldest beyond the retention bound. */
-  function trackWatch(watch: AttemptWatch): void {
-    watches.set(watch.attemptId, watch)
-    let order = watchOrder.get(watch.agent)
-    if (order === undefined) {
-      order = []
-      watchOrder.set(watch.agent, order)
-    }
-    order.push(watch.attemptId)
-    while (order.length > MAX_WATCHES_PER_AGENT) {
-      const evicted = order.shift()
-      if (evicted !== undefined) watches.delete(evicted)
-    }
-  }
-
-  /** Add one call id to the agent's deny set, evicting the oldest beyond the cap. */
-  function denyCall(agent: Agent, callId: string): void {
-    if (callId.length === 0) return
-    let denied = deniedCalls.get(agent)
-    if (denied === undefined) {
-      denied = new Set()
-      deniedCalls.set(agent, denied)
-    }
-    denied.add(callId)
-    if (denied.size > MAX_DENIED_CALL_IDS) {
-      const oldest = denied.values().next().value
-      if (oldest !== undefined) denied.delete(oldest)
-    }
-  }
-
-  /** Surface one detection: log, notify the transcript, cancel unless observing. */
-  function alert(agent: Agent, text: string, summary: string): void {
-    ctx.logger.warn(`backdoor-guard: ${text}`)
-    if (observeOnly) return
-    try {
-      agent.inject(guardNotice(text, summary))
-    } catch (error: unknown) {
-      ctx.logger.warn('backdoor-guard: notice injection failed', error)
-    }
-    agent.cancel({ kind: 'hook', reason: `backdoor-guard: ${summary}` })
-  }
-
-  /** Flag one attempt on entropy collapse and deny every tool call it owns. */
-  function flagEntropy(watch: AttemptWatch, mean: number): void {
-    watch.flagged = true
-    for (const id of watch.toolCalls.keys()) denyCall(watch.agent, id)
-    alert(
-      watch.agent,
-      `the in-flight response was stopped: its last ${windowTokens} output tokens had a mean entropy of `
-      + `${mean.toFixed(3)} nats, below the ${threshold} nats threshold. A collapsed, over-confident output `
-      + 'span is the fingerprint of a trained-in backdoor payload. Any tool calls from this response were '
-      + 'blocked before execution. Treat these model weights as untrusted until reviewed.',
-      `entropy ${mean.toFixed(3)} < ${threshold} nats`,
-    )
-  }
-
-  /** Feed one streamed chunk into the attempt's watch state. */
-  function observeChunk(watch: AttemptWatch, chunk: StreamChunk): void {
-    if (chunk.type === 'text-delta') {
-      if (!watch.seenToolCall) watch.preambleChars += chunk.text.length
-    } else if (chunk.type === 'tool-call-delta') {
-      watch.seenToolCall = true
-      const id = String(chunk.id)
-      if (id.length > 0 && !watch.toolCalls.has(id)) watch.toolCalls.set(id, chunk.name ?? '')
-      // A tool call first seen after an entropy flag is part of the payload.
-      if (watch.flagged) denyCall(watch.agent, id)
-    }
-    if (watch.flagged || !entropyEnabled || watch.entropy === undefined) return
-    const entries = (chunk as LogprobChunk).logprobs
-    if (entries === undefined) return
-    for (const entry of entries) {
-      const mean = watch.entropy.push(entry)
-      if (mean !== undefined) {
-        flagEntropy(watch, mean)
-        return
+  // Track the latest user request text so the judge sees the task context.
+  ctx.on('agent/pre-step', ({ agent, messages }, next) => {
+    const watch = watchOf(agent)
+    for (const message of messages) {
+      if (message.source.kind === 'user') {
+        const text = messageText(message as UserMessage).trim()
+        if (text.length > 0) watch.lastUserText = text
       }
     }
-  }
+    return next()
+  })
 
+  // Track the live attempt: visible preamble size and calls made so far.
   ctx.on('agent/assistant-stream', ({ agent, frame }: { agent: Agent; frame: AssistantStreamFrame }) => {
+    const watch = watchOf(agent)
     if (frame.type === 'start') {
-      trackWatch({
-        agent,
-        attemptId: frame.attemptId,
-        ...entropyEnabled ? { entropy: new EntropyWindow(windowTokens, threshold) } : {},
-        preambleChars: 0,
-        seenToolCall: false,
-        toolCalls: new Map(),
-        flagged: false,
-      })
+      watch.currentAttempt = frame.attemptId
+      watch.preambleChars = 0
+      watch.recentCalls.length = 0
       return
     }
     if (frame.type !== 'chunk') return
-    const watch = watches.get(frame.attemptId)
-    if (watch !== undefined) observeChunk(watch, frame.chunk)
+    const chunk = frame.chunk
+    if (chunk.type === 'text-delta') {
+      if (watch.recentCalls.length === 0) watch.preambleChars += chunk.text.length
+    } else if (chunk.type === 'tool-call-delta' && chunk.name !== undefined) {
+      watch.recentCalls.push(chunk.name)
+    }
   })
 
-  // Hard enforcement point. Deny never delegates: no downstream listener may
-  // talk a flagged call back into execution.
+  // The enforcement point: price every model-requested call before dispatch.
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next): Promise<PreToolDecision> => {
     if (exec.agent === undefined) return next()
-    const denied = deniedCalls.get(exec.agent)
-    if (denied !== undefined && denied.has(String(exec.callId))) {
-      if (observeOnly) {
-        ctx.logger.warn(`backdoor-guard: (observe-only) would deny flagged tool call ${exec.name}`)
-        return next()
-      }
-      return {
-        kind: 'deny',
-        reason: 'backdoor-guard: this call was produced by a response flagged as a backdoor payload; '
-          + 'it was blocked before execution',
-      }
+    if (skipPatterns.some(pattern => pattern.test(exec.name))) return next()
+    const watch = watchOf(exec.agent)
+    const argumentsText = canonicalize(exec.arguments).slice(0, maxArgsChars)
+    const userRequest = watch.lastUserText.slice(-maxRequestChars)
+    // An empty apiKeyEnv selects an unauthenticated endpoint (local d1 shim).
+    const apiKey = apiKeyEnv.length === 0 ? undefined : process.env[apiKeyEnv]
+    if (apiKeyEnv.length > 0 && (apiKey === undefined || apiKey.length === 0)) {
+      ctx.logger.warn(`backdoor-guard: ${apiKeyEnv} is not set; judge is unavailable`)
+      if (onJudgeError === 'allow') return next()
+      return { kind: 'deny', reason: `backdoor-guard: judge unavailable (${apiKeyEnv} not set)` }
     }
-    const hit: PolicyHit | undefined = policy.checkCall(exec.name, exec.arguments)
-    if (hit !== undefined) {
-      const text = `blocked tool call "${exec.name}": ${hit.detail}`
-      if (!observeOnly) {
-        try {
-          exec.agent.inject(guardNotice(text, `${hit.rule} on ${exec.name}`))
-        } catch (error: unknown) {
-          ctx.logger.warn('backdoor-guard: notice injection failed', error)
-        }
-      }
+    try {
+      const verdict = await judgeToolCall(
+        {
+          userRequest,
+          preambleChars: watch.preambleChars,
+          toolName: exec.name,
+          argumentsText,
+          recentCalls: watch.recentCalls.slice(0, -1),
+        },
+        {
+          apiKey,
+          model: config.model as string,
+          endpoint: config.endpoint as string,
+          timeoutMs,
+          signal: exec.signal,
+        },
+      )
+      if (verdict.safeProbability >= threshold) return next()
+      const text = `the judge model (${verdict.model}) rates this "${exec.name}" call unsafe `
+        + `(safe probability ${verdict.safeProbability.toFixed(2)} < ${threshold}). The call was blocked `
+        + 'before execution. If this is legitimate, rephrase the request or adjust the guard threshold.'
       ctx.logger.warn(`backdoor-guard: ${text}`)
-      if (observeOnly) return next()
-      return { kind: 'deny', reason: `backdoor-guard: ${hit.detail}` }
-    }
-    if (silentAction !== 'off' && isSensitiveTool(exec.name)) {
-      // The watch may be gone for replayed history; only judge live calls.
-      const silent = [...watches.values()].some(
-        watch => watch.agent === exec.agent
-          && watch.toolCalls.has(String(exec.callId))
-          && watch.preambleChars < minPreambleChars,
-      )
-      if (silent) {
-        const text = `sensitive tool "${exec.name}" invoked with no visible preamble in its response `
-          + `(${minPreambleChars} chars required) — the signature of a memorized payload firing on a hidden trigger`
-        ctx.logger.warn(`backdoor-guard: ${text}`)
-        if (silentAction === 'deny' && !observeOnly) {
-          try {
-            exec.agent.inject(guardNotice(text, `silent ${exec.name}`))
-          } catch (error: unknown) {
-            ctx.logger.warn('backdoor-guard: notice injection failed', error)
-          }
-          return { kind: 'deny', reason: `backdoor-guard: ${text}` }
-        }
+      try {
+        exec.agent.inject(guardNotice(text, `deny ${exec.name} p=${verdict.safeProbability.toFixed(2)}`))
+      } catch (error: unknown) {
+        ctx.logger.warn('backdoor-guard: notice injection failed', error)
       }
+      return { kind: 'deny', reason: `backdoor-guard: ${text}` }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.warn(`backdoor-guard: judge call failed: ${message}`)
+      if (onJudgeError === 'allow') return next()
+      return { kind: 'deny', reason: `backdoor-guard: judge call failed: ${message}` }
     }
-    return next()
-  })
-
-  // Canary-in-result: secret material reached the context. The result itself is
-  // already committed, so stop the turn before the value is relayed onward.
-  ctx.on('tools/post-execute', async (exec: ToolExecution, result: Readonly<ToolExecutionResult>, next): Promise<PostToolDecision> => {
-    if (exec.agent === undefined || observeOnly) return next()
-    const text = (result.content ?? [])
-      .map(block => (block as { type: string; text?: string }).text ?? '')
-      .join('\n')
-    if (text.length > 0 && policy.resultContainsCanary(text)) {
-      alert(
-        exec.agent,
-        `a tool result from "${exec.name}" contained a planted canary value. Secret material entered the `
-        + 'model context; the turn was stopped before it could be relayed onward. Audit the conversation '
-        + 'and rotate any real credentials this value resembles.',
-        `canary in ${exec.name} result`,
-      )
-    }
-    return next()
   })
 }
 
-export { EntropyWindow, tokenEntropyNats } from './entropy.js'
-export type { TokenLogprob } from './entropy.js'
-export { ToolPolicy, canonicalizeArguments, isSensitiveTool, DEFAULT_DENY_PATTERNS, DEFAULT_SENSITIVE_TOOLS } from './policy.js'
-export type { PolicyConfig, PolicyHit } from './policy.js'
+export { buildState, judgeToolCall } from './judge.js'
+export type { JudgeInput, JudgeOptions, Verdict } from './judge.js'

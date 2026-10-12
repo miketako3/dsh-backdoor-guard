@@ -1,7 +1,7 @@
 {
   "name": "dsh-backdoor-guard",
   "description": "DeepSeek Harness plugin: detects trained-in backdoor payloads (silent/memorized tool execution, credential exfiltration) and stops the agent before tools execute. Backend-agnostic; optional token-entropy detection when logprobs are available.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
