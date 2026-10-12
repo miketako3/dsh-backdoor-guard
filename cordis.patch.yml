@@ -1,0 +1,3 @@
+- insert:
+    - id: backdoor-guard
+      name: 'dsh-backdoor-guard'

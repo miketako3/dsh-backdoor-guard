@@ -1,0 +1,60 @@
+{
+  "name": "dsh-backdoor-guard",
+  "description": "DeepSeek Harness plugin: detects trained-in backdoor payloads (silent/memorized tool execution, credential exfiltration) and stops the agent before tools execute. Backend-agnostic; optional token-entropy detection when logprobs are available.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "security",
+    "backdoor-detection",
+    "llm",
+    "guard"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5-alpha.1",
+    "@deepseek-ai/dsh-agent": ">=0.2.1-alpha.2",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-alpha.2",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-alpha.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-session": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.2",
+    "@types/node": "*",
+    "typescript": "*",
+    "vitest": "*"
+  }
+}
